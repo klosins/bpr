@@ -1,7 +1,7 @@
 # Code for Bagged Polynomial Regression and Neural Networks
 This repo contains two main files mnist_bpr_multi.py and mnist_bpr_one.py.
 
-+ mnist_bpr_multi.py: Runs bagged polynomial regression to predict all ten digits in the MNIST dataset, which can be downloaded from here http://yann.lecun.com/exdb/mnist/. 
++ mnist_bpr_multi.py: Runs bagged polynomial regression to predict all ten digits in the MNIST dataset, which can be downloaded from http://yann.lecun.com/exdb/mnist/. Yann LeCun and Corinna Cortes hold the copyright of MNIST dataset, which is a derivative work from original NIST datasets. MNIST dataset is made available under the terms of the Creative Commons Attribution-Share Alike 3.0 license
 
 Code inputs: Our code for bagged polynomial regression takes in 5 inputs 
   - n_estimators = The number of base estimators in the ensemble. (fed into sklearn.ensemble.BaggingRegressor )
