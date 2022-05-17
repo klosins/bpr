@@ -15,7 +15,7 @@ Code inputs: Our code for bagged polynomial regression takes in 5 inputs
 Running code: To run code
   - First save mnist_bpr_multi.py in the same folder where the MNIST data is saved. 
   - Open terminal and navigatge to the directory with mnist_bpr_multi.py
-  - Run by writting in terminal "python3 mnist_bpr_multi.py 10 2 60000 10 1"
-
+  - Run by writting in terminal "python3 mnist_bpr_multi.py 15 2 60000 10 1". This will run the code with n_estimators = 15, poly_degree = 2, max_samples = 60,000, max_features = 10, and c_reg = 1. 
+  - Result of code will be saved in a file titled "results.txt"
 
 + mnist_bpr_one.py: Runs bagged polynomial regression to predict the digit 1 from the MNIST dataset. Same inputs as mnist_bpr_multi.py. 
