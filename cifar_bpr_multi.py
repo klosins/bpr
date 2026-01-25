@@ -28,7 +28,7 @@ start_time = time()
 logging.basicConfig(level=logging.INFO)
 
 # Constants.
-DATA_FILE_PATH = "/Users/sylviaklosin/Documents/GradSchool/research/bag_poly/crop/WinnipegDataset.txt"  # Update this with your dataset path
+DATA_FILE_PATH = "data/WinnipegDataset.txt"
 # Parse parameters.
 n_estimators = 60#int(argv[1])
 poly_degree = 2#int(argv[2])
