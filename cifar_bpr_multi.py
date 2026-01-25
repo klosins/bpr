@@ -65,7 +65,7 @@ for i in range(1,NUM_CLASSES):
 
     # Create a bagging classifier with desired features.
     estimator[i] = BaggingClassifier(
-        base_estimator=pipe,
+        estimator=pipe,
         n_estimators=n_estimators,
         max_features=max_features,
         max_samples=max_samples,
