@@ -14,3 +14,5 @@ __pycache__/
 # VS Code
 .vscode/
 .env
+data/WinnipegDataset.txt
+/paper_draft/
