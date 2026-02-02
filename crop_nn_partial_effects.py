@@ -6,10 +6,11 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from tensorflow import keras
-from tensorflow.keras import layers
 
 
 COLNAMES = [
@@ -78,24 +79,35 @@ def load_data(file_path, colnames=None):
 
 
 def build_model(input_dim, num_classes, seed):
-    keras.utils.set_random_seed(seed)
-    model = keras.Sequential(
-        [
-            layers.Input(shape=(input_dim,)),
-            layers.Dense(128, activation="relu"),
-            layers.Dense(64, activation="relu"),
-            layers.Dense(num_classes, activation="softmax"),
-        ]
-    )
-    model.compile(
-        optimizer="adam",
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"],
+    torch.manual_seed(seed)
+    model = nn.Sequential(
+        nn.Linear(input_dim, 128),
+        nn.ReLU(),
+        nn.Linear(128, 64),
+        nn.ReLU(),
+        nn.Linear(64, num_classes),
     )
     return model
 
 
-def compute_pdp_ice(model, X_raw, scaler, feature_idx, class_idx, grid, subsample, seed):
+def evaluate_model(model, X, y, device, batch_size):
+    model.eval()
+    correct = 0
+    total = 0
+    dataset = TensorDataset(torch.from_numpy(X).float(), torch.from_numpy(y).long())
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            logits = model(xb)
+            preds = torch.argmax(logits, dim=1)
+            correct += (preds == yb).sum().item()
+            total += yb.numel()
+    return correct / total if total else 0.0
+
+
+def compute_pdp_ice(model, X_raw, scaler, feature_idx, class_idx, grid, subsample, seed, device):
     rng = np.random.default_rng(seed)
     num_samples = min(subsample, X_raw.shape[0])
     sample_idx = rng.choice(X_raw.shape[0], size=num_samples, replace=False)
@@ -107,14 +119,18 @@ def compute_pdp_ice(model, X_raw, scaler, feature_idx, class_idx, grid, subsampl
         X_mod = X_raw.copy()
         X_mod[:, feature_idx] = value
         X_scaled = scaler.transform(X_mod)
-        preds = model.predict(X_scaled, batch_size=1024, verbose=0)
-        pdp.append(preds[:, class_idx].mean())
+        with torch.no_grad():
+            logits = model(torch.from_numpy(X_scaled).float().to(device))
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+        pdp.append(probs[:, class_idx].mean())
 
         X_sample_mod = X_sample.copy()
         X_sample_mod[:, feature_idx] = value
         X_sample_scaled = scaler.transform(X_sample_mod)
-        sample_preds = model.predict(X_sample_scaled, batch_size=1024, verbose=0)
-        ice[:, j] = sample_preds[:, class_idx]
+        with torch.no_grad():
+            logits = model(torch.from_numpy(X_sample_scaled).float().to(device))
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+        ice[:, j] = probs[:, class_idx]
     return np.array(pdp), ice
 
 
@@ -143,6 +159,17 @@ def main():
 
     logging.basicConfig(level=logging.INFO)
     np.random.seed(args.seed)
+
+    crop_labels = {
+        1: "corn",
+        2: "peas",
+        3: "canola",
+        4: "soybeans",
+        5: "oats",
+        6: "wheat",
+        7: "broadleaf",
+    }
+    crop_name = crop_labels.get(args.target_class, f"class{args.target_class}")
 
     X_train_raw, X_test_raw, y_train, y_test = load_data(args.data, colnames=COLNAMES)
     mask_train = ~pd.DataFrame(X_train_raw).isna().any(axis=1)
@@ -173,23 +200,40 @@ def main():
     if args.target_class not in class_to_index:
         raise ValueError(f"Target class {args.target_class} not found in training labels.")
     class_idx = class_to_index[args.target_class]
+    y_train = np.array([class_to_index[c] for c in y_train])
+    y_test = np.array([class_to_index[c] for c in y_test])
 
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train_raw)
     X_test = scaler.transform(X_test_raw)
 
-    model = build_model(X_train.shape[1], num_classes, args.seed)
-    model.fit(
-        X_train,
-        y_train,
-        epochs=args.epochs,
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = build_model(X_train.shape[1], num_classes, args.seed).to(device)
+    optimizer = torch.optim.Adam(model.parameters())
+    criterion = nn.CrossEntropyLoss()
+
+    X_train_tensor = torch.from_numpy(X_train).float()
+    y_train_tensor = torch.from_numpy(y_train).long()
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=args.batch_size,
-        validation_split=0.1,
-        verbose=1,
+        shuffle=True,
     )
 
-    train_loss, train_acc = model.evaluate(X_train, y_train, verbose=0)
-    test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
+    model.train()
+    for _ in range(args.epochs):
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+
+    train_acc = evaluate_model(model, X_train, y_train, device, args.batch_size)
+    test_acc = evaluate_model(model, X_test, y_test, device, args.batch_size)
     logging.info("Train accuracy: %.4f", train_acc)
     logging.info("Test accuracy: %.4f", test_acc)
 
@@ -204,26 +248,30 @@ def main():
         grid,
         args.subsample,
         args.seed,
+        device,
     )
 
     fig, ax = plt.subplots(figsize=(8, 6))
     for i in range(ice.shape[0]):
-        ax.plot(grid, ice[i], color="gray", linewidth=1, alpha=0.3)
-    ax.plot(grid, pdp, color="red", linewidth=2)
+        label = "ICE (individual curves)" if i == 0 else None
+        ax.plot(grid, ice[i], color="gray", linewidth=1, alpha=0.3, label=label)
+    ax.plot(grid, pdp, color="red", linewidth=2, label="PDP (average)")
     ax.set_xlabel(feature_name)
     ax.set_ylabel("Partial Dependence (probability)")
-    ax.set_title(f"PDP + ICE for {feature_name} (class {args.target_class})")
+    ax.set_title(f"PDP + ICE for {feature_name} ({crop_name})")
     ax.grid(True)
+    ax.legend()
     plt.tight_layout()
 
     os.makedirs("output", exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join(
         "output",
-        f"nn_pdp_{feature_name}_class{args.target_class}_{timestamp}.png",
+        f"nn_pdp_{feature_name}_{crop_name}_{timestamp}.png",
     )
     fig.savefig(out_path, dpi=150)
     logging.info("Saved PDP/ICE plot to %s", out_path)
+    plt.show()
 
 
 if __name__ == "__main__":
