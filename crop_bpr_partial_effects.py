@@ -6,7 +6,8 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from sklearn.ensemble import BaggingClassifier
+from types import SimpleNamespace
+from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler
@@ -89,7 +90,79 @@ def resolve_feature_index(feature, feature_names):
     return feature_names.index(feature)
 
 
-def compute_pdp_ice(model, X_raw, feature_idx, grid, subsample, seed, class_index):
+def _aligned_proba(estimator, X, class_labels):
+    est_proba = estimator.predict_proba(X)
+    if est_proba.shape[1] == len(class_labels):
+        return est_proba
+    aligned = np.zeros((X.shape[0], len(class_labels)))
+    for idx, label in enumerate(estimator.classes_):
+        target_idx = np.where(class_labels == label)[0][0]
+        aligned[:, target_idx] = est_proba[:, idx]
+    return aligned
+
+
+def _ensemble_predict_proba(model, X, estimator_indices=None):
+    if estimator_indices is None:
+        estimator_indices = range(len(model.estimators_))
+    probs = np.zeros((X.shape[0], len(model.classes_)))
+    for i in estimator_indices:
+        estimator = model.estimators_[i]
+        features = model.estimators_features_[i]
+        est_proba = _aligned_proba(estimator, X[:, features], model.classes_)
+        probs += est_proba
+    return probs / len(estimator_indices)
+
+
+def _ensemble_predict(model, X, estimator_indices=None):
+    probs = _ensemble_predict_proba(model, X, estimator_indices)
+    return model.classes_[np.argmax(probs, axis=1)]
+
+
+def fit_bpr_ensemble(
+    X,
+    y,
+    base_estimator,
+    n_estimators,
+    max_samples,
+    max_features,
+    seed,
+    bootstrap,
+    min_class_count,
+    max_resample_attempts,
+):
+    rng = np.random.default_rng(seed)
+    n_samples, n_features = X.shape
+    n_boot = max_samples if bootstrap else min(max_samples, n_samples)
+    n_feat = min(max_features, n_features)
+
+    classes = np.unique(y)
+    estimators = []
+    estimators_features = []
+    for _ in range(n_estimators):
+        for _ in range(max_resample_attempts):
+            feature_idx = rng.choice(n_features, size=n_feat, replace=False)
+            sample_idx = rng.choice(n_samples, size=n_boot, replace=bootstrap)
+            y_sample = y[sample_idx]
+            if all(np.sum(y_sample == cls) >= min_class_count for cls in classes):
+                est = clone(base_estimator)
+                est.fit(X[sample_idx][:, feature_idx], y_sample)
+                estimators.append(est)
+                estimators_features.append(feature_idx)
+                break
+        else:
+            raise RuntimeError(
+                "Could not draw a bootstrap sample with enough class balance; "
+                "try increasing max_samples or lowering min_class_count."
+            )
+
+    return SimpleNamespace(
+        estimators_=estimators,
+        estimators_features_=estimators_features,
+        classes_=classes,
+    )
+
+
+def compute_pdp_ice(model, X_raw, feature_idx, grid, subsample, seed, class_index, estimator_indices=None):
     rng = np.random.default_rng(seed)
     num_samples = min(subsample, X_raw.shape[0])
     sample_idx = rng.choice(X_raw.shape[0], size=num_samples, replace=False)
@@ -100,12 +173,12 @@ def compute_pdp_ice(model, X_raw, feature_idx, grid, subsample, seed, class_inde
     for j, value in enumerate(grid):
         X_mod = X_raw.copy()
         X_mod[:, feature_idx] = value
-        probs = model.predict_proba(X_mod)[:, class_index]
+        probs = _ensemble_predict_proba(model, X_mod, estimator_indices)[:, class_index]
         pdp.append(probs.mean())
 
         X_sample_mod = X_sample.copy()
         X_sample_mod[:, feature_idx] = value
-        ice[:, j] = model.predict_proba(X_sample_mod)[:, class_index]
+        ice[:, j] = _ensemble_predict_proba(model, X_sample_mod, estimator_indices)[:, class_index]
     return np.array(pdp), ice
 
 
@@ -122,6 +195,25 @@ def main():
     parser.add_argument("--max-samples", type=int, default=250, help="Bagging samples per estimator.")
     parser.add_argument("--max-features", type=int, default=10, help="Bagging features per estimator.")
     parser.add_argument("--c-reg", type=float, default=1.0, help="Logistic regression C.")
+    parser.add_argument("--n-jobs", type=int, default=1, help="Parallel jobs for bagging.")
+    parser.add_argument("--bootstrap", action="store_true", help="Use bootstrap sampling.")
+    parser.add_argument(
+        "--min-class-count",
+        type=int,
+        default=1,
+        help="Minimum per-class count required in each bagged sample.",
+    )
+    parser.add_argument(
+        "--max-resample-attempts",
+        type=int,
+        default=200,
+        help="Resampling attempts before giving up on a bagged estimator.",
+    )
+    parser.add_argument(
+        "--feature-only-estimators",
+        action="store_true",
+        help="Average PDP/ICE over estimators that include the chosen feature.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
@@ -172,18 +264,20 @@ def main():
         ]
     )
 
-    estimator = BaggingClassifier(
-        estimator=pipe,
+    estimator = fit_bpr_ensemble(
+        X_train_raw,
+        y_train_onehot,
+        pipe,
         n_estimators=args.n_estimators,
-        max_features=args.max_features,
         max_samples=args.max_samples,
-        n_jobs=4,
-        random_state=args.seed,
+        max_features=args.max_features,
+        seed=args.seed,
+        bootstrap=args.bootstrap,
+        min_class_count=args.min_class_count,
+        max_resample_attempts=args.max_resample_attempts,
     )
-
-    estimator.fit(X_train_raw, y_train_onehot)
-    yhat_train = estimator.predict(X_train_raw)
-    yhat_test = estimator.predict(X_test_raw)
+    yhat_train = _ensemble_predict(estimator, X_train_raw)
+    yhat_test = _ensemble_predict(estimator, X_test_raw)
 
     accuracy_train = np.mean(yhat_train == y_train_onehot)
     accuracy_test = np.mean(yhat_test == y_test_onehot)
@@ -191,6 +285,18 @@ def main():
     logging.info("Test accuracy: %.4f", accuracy_test)
 
     class_index = int(np.where(estimator.classes_ == True)[0][0])
+    estimator_indices = None
+    if args.feature_only_estimators:
+        estimator_indices = [
+            i for i, features in enumerate(estimator.estimators_features_) if feature_idx in features
+        ]
+        if not estimator_indices:
+            logging.warning(
+                "No estimators include feature %s; using full ensemble for PDP/ICE.",
+                feature_name,
+            )
+            estimator_indices = None
+
     feature_values = X_train_raw[:, feature_idx]
     grid = np.linspace(feature_values.min(), feature_values.max(), args.grid_points)
     pdp, ice = compute_pdp_ice(
@@ -201,6 +307,7 @@ def main():
         args.subsample,
         args.seed,
         class_index,
+        estimator_indices,
     )
 
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -211,6 +318,7 @@ def main():
     ax.set_xlabel(feature_name)
     ax.set_ylabel("Partial Dependence (probability)")
     ax.set_title(f"PDP + ICE for {feature_name} ({crop_name})")
+    ax.set_ylim(0, 1)
     ax.grid(True)
     ax.legend()
     plt.tight_layout()
